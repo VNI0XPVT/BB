@@ -1,0 +1,226 @@
+import aiohttp, asyncio, httpx
+import logging, re, uuid, uvicorn, yt_dlp
+
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.responses import StreamingResponse
+from fastapi.security.api_key import APIKeyQuery
+from logging.handlers import RotatingFileHandler
+from youtubesearchpython.__future__ import VideosSearch
+
+
+logging.basicConfig(
+    format="%(asctime)s [%(name)s]:: %(levelname)s - %(message)s",
+    level=logging.INFO,
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        RotatingFileHandler("api.log", maxBytes=(1024 * 1024 * 5), backupCount=10),
+        logging.StreamHandler(),
+    ],
+)
+
+logging.getLogger("asyncio").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+
+logs = logging.getLogger(__name__)
+
+
+app = FastAPI()
+database = {}
+ip_address = {}
+
+
+api_keys = {
+    "private": "1a873582a7c83342f961cc0a177b2b26"
+}
+
+api_key_query = APIKeyQuery(name="api_key", auto_error=True)
+
+
+async def get_user(api_key: str = Security(api_key_query)):
+    for user, key in api_keys.items():
+        if key == api_key:
+            return user
+    
+    raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+async def new_uid() -> str:
+    return str(uuid.uuid4())
+    
+
+async def get_public_ip() -> str:
+    if ip_address.get("ip_address"):
+        return ip_address["ip_address"]
+
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            response = await client.get('https://api.ipify.org')
+            public_ip = response.text
+            ip_address["ip_address"] = public_ip
+            return public_ip
+    except:
+        return "localhost"
+
+
+async def get_youtube_url(query: str) -> str:
+    if bool(re.match(r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/(?:watch\?v=|embed/|v/|shorts/|live/)?([A-Za-z0-9_-]{11})(?:[?&].*)?$', query)):
+        match = re.search(r'(?:v=|\/(?:embed|v|shorts|live)\/|youtu\.be\/)([A-Za-z0-9_-]{11})', query)
+        if match:
+            return f"https://www.youtube.com/watch?v={match.group(1)}"
+        
+    try:
+        search = VideosSearch(query, limit=1)
+        result = await search.next()
+        return result["result"][0]["link"]
+    except Exception:
+        return ""
+
+
+async def extract_metadata(url: str, video: bool = False):
+    if not url:
+        return {}
+        
+    format_type = "best" if video else "bestaudio/best"
+
+    ydl_opts = {
+        "format": format_type,
+        "no_warnings": True,
+        "simulate": True,
+        "quiet": True,
+        "noplaylist": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "force_generic_extractor": True,
+    }
+    
+    def sync_extract_metadata():
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception:
+            return {}
+
+    loop = asyncio.get_running_loop()
+    metadata = await loop.run_in_executor(None, sync_extract_metadata)
+
+    if metadata:
+        return {
+            "id": metadata.get("id"),
+            "title": metadata.get("title"),
+            "duration": metadata.get("duration"),
+            "link": metadata.get("webpage_url"),
+            "channel": metadata.get("channel", "Aditya Halder"),
+            "views": metadata.get("view_count"),
+            "thumbnail": metadata.get("thumbnail"),
+            "stream_url": metadata.get("url"),
+            "stream_type": "Video" if video else "Audio",
+        }
+        
+    return {}
+
+
+class Streamer:
+    def __init__(self):
+        self.chunk_size = 1 * 1024 * 1024  # Larger chunk size for fewer requests and smoother playback
+
+    async def get_total_chunks(self, file_url):
+        async with httpx.AsyncClient() as client:
+            response = await client.head(file_url)
+            file_size = response.headers.get("Content-Length")
+            return (int(file_size) + self.chunk_size - 1) // self.chunk_size if file_size else None
+
+    async def fetch_chunk(self, file_url, chunk_id):
+        start_byte = chunk_id * self.chunk_size
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:  # Increased timeout for CDN reliability
+            headers = {
+                "Range": f"bytes={start_byte}-{start_byte + self.chunk_size - 1}",
+                "User-Agent": "Mozilla/5.0"
+            }
+            response = await client.get(file_url, headers=headers)
+            return response.content if response.status_code in {206, 200} else None
+
+    async def stream_file(self, file_url):
+        total_chunks = await self.get_total_chunks(file_url)
+        received_chunks = set()
+        chunk_id = 0
+
+        while total_chunks is None or chunk_id < total_chunks:
+            # Prefetch chunks for faster buffering
+            next_chunk_task = asyncio.create_task(self.fetch_chunk(file_url, chunk_id + 1))
+            current_chunk_task = asyncio.create_task(self.fetch_chunk(file_url, chunk_id))
+
+            current_chunk = await current_chunk_task
+            if current_chunk:
+                received_chunks.add(chunk_id)
+                yield current_chunk
+
+            next_chunk = await next_chunk_task
+            if next_chunk:
+                received_chunks.add(chunk_id + 1)
+                yield next_chunk
+
+            chunk_id += 2
+
+        if total_chunks:
+            for chunk_id in range(total_chunks):
+                if chunk_id not in received_chunks:
+                    missing_chunk = await self.fetch_chunk(file_url, chunk_id)
+                    if missing_chunk:
+                        yield missing_chunk
+
+
+@app.get("/youtube")
+async def get_youtube_info(query: str, video: bool = False, user: str = Security(get_user)):
+    try:
+        url = await get_youtube_url(query)
+        metadata = await extract_metadata(url, video)
+        if not metadata:
+            return {}
+            
+        extention = "mp3" if not video else "mp4"
+        
+        file_url = metadata.get("stream_url")
+        file_name = f"{metadata.get('id')}.{extention}"
+        ip_address = await get_public_ip()
+        stream_id = await new_uid()
+        stream_url = f"http://{ip_address}:1470/stream/{stream_id}"
+        database[stream_id] = {"file_url": file_url, "file_name": file_name}
+
+        return {
+            "id": metadata.get("id"),
+            "title": metadata.get("title"),
+            "duration": metadata.get("duration"),
+            "link": metadata.get("link"),
+            "channel": metadata.get("channel"),
+            "views": metadata.get("views"),
+            "thumbnail": metadata.get("thumbnail"),
+            "stream_url": stream_url,
+            "stream_type": metadata.get("stream_type"),
+        }
+    except Exception:
+        return {}
+
+
+@app.get("/stream/{stream_id}")
+async def stream_from_stream_url(stream_id: str):
+    file_data = database.get(stream_id)  # Make sure this lookup is optimized
+    if not file_data or not file_data.get("file_url") or not file_data.get("file_name"):
+        return {"error": "Invalid stream request!"}
+
+    streamer = Streamer()
+    try:
+        headers = {"Content-Disposition": f"attachment; filename=\"{file_data.get('file_name')}\""}
+        return StreamingResponse(
+            streamer.stream_file(file_data.get("file_url")), 
+            media_type="application/octet-stream", 
+            headers=headers
+        )
+    except Exception as e:
+        logging.error(f"Stream Error: {e}")
+        return {"error": "Something went wrong!"}
+
+
+
+                                        
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=1470)
