@@ -1,383 +1,227 @@
-# main.py — hardened, better logs, flexible auth, YT fallback, CORS, health
-from __future__ import annotations
+import aiohttp, asyncio, httpx
+import logging, re, uuid, uvicorn, yt_dlp
 
-from fastapi import FastAPI, HTTPException, Query, Header, Depends
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.responses import StreamingResponse
+from fastapi.security.api_key import APIKeyQuery
+from logging.handlers import RotatingFileHandler
+from youtubesearchpython.__future__ import VideosSearch
 
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
-from dotenv import load_dotenv
-
-import subprocess
-import sys
-import os
-import tempfile
-import logging
-import json
-import re
-from urllib.parse import urlparse, parse_qs
-
-from pymongo import MongoClient
-import requests
-
-# -------------------------------
-# Logging
-# -------------------------------
 logging.basicConfig(
+    format="%(asctime)s [%(name)s]:: %(levelname)s - %(message)s",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("YT-Telegram-API")
-
-# -------------------------------
-# Load environment variables
-# -------------------------------
-load_dotenv()
-
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-API_KEY = os.getenv("API_KEY")
-MONGO_URI = os.getenv("MONGO_URI")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL")
-
-if not all([YOUTUBE_API_KEY, API_KEY, MONGO_URI, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL]):
-    raise RuntimeError(
-        "Missing environment variables. Need YOUTUBE_API_KEY, API_KEY, MONGO_URI, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL"
-    )
-
-logger.info("Environment loaded.")
-
-# -------------------------------
-# MongoDB Client
-# -------------------------------
-mongo = MongoClient(MONGO_URI)
-db = mongo["yt_stream"]
-collection = db["songs"]
-logger.info("Mongo connected.")
-
-# -------------------------------
-# YouTube API client (lazily created on first use)
-# -------------------------------
-_youtube_client = None
-
-def get_youtube_client():
-    global _youtube_client
-    if _youtube_client is None:
-        _youtube_client = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
-        logger.info("YouTube API client initialized.")
-    return _youtube_client
-
-# -------------------------------
-# FastAPI App
-# -------------------------------
-app = FastAPI(
-    title="YouTube -> Telegram Streaming API",
-    description="Endpoints: /health, /yt_search, /info, /stream, /download",
-    version="1.2-hardened",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        RotatingFileHandler("api.log", maxBytes=(1024 * 1024 * 5), backupCount=10),
+        logging.StreamHandler(),
+    ],
 )
 
-# CORS (in case bot / web client hits from elsewhere)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+logging.getLogger("asyncio").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
 
-# -------------------------------
-# Helpers
-# -------------------------------
+logs = logging.getLogger(__name__)
 
-def run_yt_dlp(args: list[str], timeout: int = 45) -> str:
-    """Run yt-dlp via the current Python interpreter. Returns stdout (stripped)."""
-    cmd = [sys.executable, "-m", "yt_dlp"] + args
-    logger.info(f"Running yt-dlp: {' '.join(cmd)}")
+
+app = FastAPI()
+database = {}
+ip_address = {}
+
+
+api_keys = {
+    "private": "1a873582a7c83342f961cc0a177b2b26"
+}
+
+api_key_query = APIKeyQuery(name="api_key", auto_error=True)
+
+
+async def get_user(api_key: str = Security(api_key_query)):
+    for user, key in api_keys.items():
+        if key == api_key:
+            return user
+    
+    raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+async def new_uid() -> str:
+    return str(uuid.uuid4())
+    
+
+async def get_public_ip() -> str:
+    if ip_address.get("ip_address"):
+        return ip_address["ip_address"]
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        logger.error("yt-dlp timed out")
-        raise HTTPException(status_code=504, detail="yt-dlp timed out")
-
-    if result.returncode != 0:
-        logger.error(f"yt-dlp failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
-        raise HTTPException(status_code=502, detail=f"yt-dlp failed: {result.stderr.strip()}")
-
-    logger.info("yt-dlp succeeded.")
-    return result.stdout.strip()
+        async with httpx.AsyncClient(timeout=None) as client:
+            response = await client.get('https://api.ipify.org')
+            public_ip = response.text
+            ip_address["ip_address"] = public_ip
+            return public_ip
+    except:
+        return "localhost"
 
 
-def send_to_telegram(file_path: str, caption: str | None = None):
-    """Send audio file to Telegram channel, enforce ~50MB limit."""
-    file_size = os.path.getsize(file_path)
-    logger.info(f"Sending to Telegram: {file_path} ({file_size} bytes)")
-
-    if file_size > 50 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File size exceeds 50MB limit")
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio"
-    with open(file_path, "rb") as f:
-        files = {"audio": f}
-        data = {"chat_id": TELEGRAM_CHANNEL, "caption": caption or ""}
-        r = requests.post(url, files=files, data=data, timeout=60)
-
-    if not r.ok:
-        logger.error(f"Telegram upload failed: {r.status_code} {r.text}")
-        raise HTTPException(status_code=502, detail=f"Telegram upload failed: {r.status_code}")
-
-    logger.info("Telegram upload OK.")
-    return r.json()
-
-
-def extract_video_id(url: str) -> str | None:
-    """Extract a YouTube video ID from various URL formats."""
+async def get_youtube_url(query: str) -> str:
+    if bool(re.match(r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/(?:watch\?v=|embed/|v/|shorts/|live/)?([A-Za-z0-9_-]{11})(?:[?&].*)?$', query)):
+        match = re.search(r'(?:v=|\/(?:embed|v|shorts|live)\/|youtu\.be\/)([A-Za-z0-9_-]{11})', query)
+        if match:
+            return f"https://www.youtube.com/watch?v={match.group(1)}"
+        
     try:
-        u = urlparse(url)
-        if u.netloc.endswith("youtu.be"):
-            # https://youtu.be/<id>
-            vid = u.path.lstrip("/")
-            return vid or None
-
-        if "watch" in u.path:
-            # https://www.youtube.com/watch?v=<id>
-            q = parse_qs(u.query)
-            return (q.get("v", [None])[0])
-
-        # shorts or embed
-        m = re.search(r"/(shorts|embed)/([A-Za-z0-9_-]{6,})", u.path)
-        if m:
-            return m.group(2)
+        search = VideosSearch(query, limit=1)
+        result = await search.next()
+        return result["result"][0]["link"]
     except Exception:
-        return None
-    return None
+        return ""
 
 
-# -------------------------------
-# Auth dependency (accepts multiple header styles)
-# -------------------------------
+async def extract_metadata(url: str, video: bool = False):
+    if not url:
+        return {}
+        
+    format_type = "best" if video else "bestaudio/best"
 
-def get_api_key(
-    api_key: str | None = Header(None, alias="api-key"),
-    x_api_key: str | None = Header(None, alias="x-api-key"),
-    authorization: str | None = Header(None, alias="Authorization"),
-):
-    """Allow api-key, x-api-key, or Authorization: Bearer <token>."""
-    token = None
-    if api_key:
-        token = api_key
-    elif x_api_key:
-        token = x_api_key
-    elif authorization and authorization.startswith("Bearer "):
-        token = authorization.replace("Bearer ", "", 1)
-
-    if token != API_KEY:
-        logger.warning("Auth failed: provided key does not match.")
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-    return True
-
-
-# -------------------------------
-# YouTube search (Data API with yt-dlp fallback)
-# -------------------------------
-
-def youtube_search(query: str, max_results: int = 5):
-    logger.info(f"youtube_search(query={query!r}, max_results={max_results})")
-
-    # Try official Data API first
-    try:
-        yt = get_youtube_client()
-        request = yt.search().list(part="snippet", q=query, maxResults=max_results, type="video")
-        response = request.execute()
-        items = response.get("items", [])
-        results = [
-            {
-                "title": it["snippet"]["title"],
-                "videoId": it["id"]["videoId"],
-                "url": f"https://www.youtube.com/watch?v={it['id']['videoId']}",
-            }
-            for it in items
-        ]
-        if results:
-            return results
-        logger.info("YouTube Data API returned 0 items, will try yt-dlp fallback.")
-    except HttpError as e:
-        logger.error(f"YouTube API error: {e}")
-        # fall through to yt-dlp fallback
-    except Exception as e:
-        logger.error(f"YouTube API unexpected error: {e}")
-        # fall through to yt-dlp fallback
-
-    # Fallback: yt-dlp search (no quota needed)
-    try:
-        # yt-dlp prints one JSON per line for search results
-        out = run_yt_dlp([
-            "--dump-json",
-            f"ytsearch{max_results}:{query}",
-        ])
-        results = []
-        for line in out.splitlines():
-            try:
-                j = json.loads(line)
-                if j.get("webpage_url") and j.get("title"):
-                    # Attempt to get id from url if missing
-                    vid = j.get("id")
-                    if not vid and j.get("webpage_url"):
-                        vid = extract_video_id(j["webpage_url"]) or ""
-                    results.append({
-                        "title": j.get("title"),
-                        "videoId": vid,
-                        "url": j.get("webpage_url"),
-                    })
-            except json.JSONDecodeError:
-                continue
-        logger.info(f"yt-dlp fallback returned {len(results)} items")
-        return results
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"yt-dlp fallback failed: {e}")
-        return []
-
-
-# -------------------------------
-# Routes
-# -------------------------------
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "service": "yt-telegram-api", "version": "1.2-hardened"}
-
-
-@app.get("/yt_search")
-def yt_search_endpoint(
-    query: str = Query(..., description="Search query for YouTube"),
-    limit: int = Query(5, ge=1, le=20, description="Max results (1-20)"),
-    _ok: bool = Depends(get_api_key),
-):
-    try:
-        results = youtube_search(query, max_results=limit)
-        return {"results": results}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Unexpected error in /yt_search")
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
-
-
-@app.get("/info")
-def get_info(
-    url: str = Query(..., description="YouTube URL (watch, youtu.be, shorts supported)"),
-    _ok: bool = Depends(get_api_key),
-):
-    try:
-        vid = extract_video_id(url)
-        if not vid:
-            # as a last resort, try query param v= in case of weird formatting
-            q = parse_qs(urlparse(url).query)
-            vid = (q.get("v", [None])[0])
-        if not vid:
-            raise HTTPException(status_code=400, detail="Could not extract video id")
-
-        yt = get_youtube_client()
-        request = yt.videos().list(part="snippet,contentDetails,statistics", id=vid)
-        response = request.execute()
-        items = response.get("items", [])
-        if not items:
-            raise HTTPException(status_code=404, detail="Video not found")
-        item = items[0]
-        return {
-            "title": item["snippet"]["title"],
-            "uploader": item["snippet"]["channelTitle"],
-            "duration": item["contentDetails"]["duration"],
-            "view_count": item["statistics"].get("viewCount"),
-            "webpage_url": url,
-            "thumbnail": item["snippet"]["thumbnails"]["high"]["url"],
-        }
-    except HttpError as e:
-        reason = getattr(e, "_get_reason", lambda: str(e))()
-        raise HTTPException(status_code=502, detail=f"YouTube API error: {reason}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Unexpected error in /info")
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
-
-
-@app.get("/stream")
-def stream(
-    url: str | None = Query(None, description="Full YouTube URL"),
-    query: str | None = Query(None, description="Search on YouTube and take first result"),
-    _ok: bool = Depends(get_api_key),
-):
-    try:
-        if query and not url:
-            search_res = youtube_search(query, max_results=1)
-            if not search_res:
-                raise HTTPException(status_code=404, detail="No video found")
-            url = search_res[0]["url"]
-
-        if not url:
-            raise HTTPException(status_code=400, detail="You must provide url or query")
-
-        # Ask yt-dlp for direct bestaudio URL
-        output = run_yt_dlp([
-            "-f", "bestaudio",
-            "--no-playlist",
-            "--get-url",
-            url,
-        ])
-
-        # Store in Mongo (best-effort)
+    ydl_opts = {
+        "format": format_type,
+        "no_warnings": True,
+        "simulate": True,
+        "quiet": True,
+        "noplaylist": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "force_generic_extractor": True,
+    }
+    
+    def sync_extract_metadata():
         try:
-            collection.insert_one({"url": url, "direct_url": output})
-        except Exception as mongo_err:
-            logger.error(f"Mongo insert failed: {mongo_err}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception:
+            return {}
 
-        return {"direct_url": output, "youtube_url": url}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Unexpected error in /stream")
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+    loop = asyncio.get_running_loop()
+    metadata = await loop.run_in_executor(None, sync_extract_metadata)
+
+    if metadata:
+        return {
+            "id": metadata.get("id"),
+            "title": metadata.get("title"),
+            "duration": metadata.get("duration"),
+            "link": metadata.get("webpage_url"),
+            "channel": metadata.get("channel", "Aditya Halder"),
+            "views": metadata.get("view_count"),
+            "thumbnail": metadata.get("thumbnail"),
+            "stream_url": metadata.get("url"),
+            "stream_type": "Video" if video else "Audio",
+        }
+        
+    return {}
 
 
-@app.get("/download")
-def download_mp3(
-    url: str = Query(..., description="Full YouTube URL"),
-    _ok: bool = Depends(get_api_key),
-):
+class Streamer:
+    def __init__(self):
+        self.chunk_size = 1 * 1024 * 1024  # Larger chunk size for fewer requests and smoother playback
+
+    async def get_total_chunks(self, file_url):
+        async with httpx.AsyncClient() as client:
+            response = await client.head(file_url)
+            file_size = response.headers.get("Content-Length")
+            return (int(file_size) + self.chunk_size - 1) // self.chunk_size if file_size else None
+
+    async def fetch_chunk(self, file_url, chunk_id):
+        start_byte = chunk_id * self.chunk_size
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:  # Increased timeout for CDN reliability
+            headers = {
+                "Range": f"bytes={start_byte}-{start_byte + self.chunk_size - 1}",
+                "User-Agent": "Mozilla/5.0"
+            }
+            response = await client.get(file_url, headers=headers)
+            return response.content if response.status_code in {206, 200} else None
+
+    async def stream_file(self, file_url):
+        total_chunks = await self.get_total_chunks(file_url)
+        received_chunks = set()
+        chunk_id = 0
+
+        while total_chunks is None or chunk_id < total_chunks:
+            # Prefetch chunks for faster buffering
+            next_chunk_task = asyncio.create_task(self.fetch_chunk(file_url, chunk_id + 1))
+            current_chunk_task = asyncio.create_task(self.fetch_chunk(file_url, chunk_id))
+
+            current_chunk = await current_chunk_task
+            if current_chunk:
+                received_chunks.add(chunk_id)
+                yield current_chunk
+
+            next_chunk = await next_chunk_task
+            if next_chunk:
+                received_chunks.add(chunk_id + 1)
+                yield next_chunk
+
+            chunk_id += 2
+
+        if total_chunks:
+            for chunk_id in range(total_chunks):
+                if chunk_id not in received_chunks:
+                    missing_chunk = await self.fetch_chunk(file_url, chunk_id)
+                    if missing_chunk:
+                        yield missing_chunk
+
+
+@app.get("/youtube")
+async def get_youtube_info(query: str, video: bool = False, user: str = Security(get_user)):
     try:
-        temp_dir = tempfile.mkdtemp(prefix="ytmp3_")
-        out_file = os.path.join(temp_dir, "%(title)s.%(ext)s")
+        url = await get_youtube_url(query)
+        metadata = await extract_metadata(url, video)
+        if not metadata:
+            return {}
+            
+        extention = "mp3" if not video else "mp4"
+        
+        file_url = metadata.get("stream_url")
+        file_name = f"{metadata.get('id')}.{extention}"
+        ip_address = await get_public_ip()
+        stream_id = await new_uid()
+        stream_url = f"http://{ip_address}:1470/stream/{stream_id}"
+        database[stream_id] = {"file_url": file_url, "file_name": file_name}
 
-        run_yt_dlp([
-            "--extract-audio",
-            "--audio-format", "mp3",
-            "--no-playlist",
-            "-o", out_file,
-            url,
-        ])
+        return {
+            "id": metadata.get("id"),
+            "title": metadata.get("title"),
+            "duration": metadata.get("duration"),
+            "link": metadata.get("link"),
+            "channel": metadata.get("channel"),
+            "views": metadata.get("views"),
+            "thumbnail": metadata.get("thumbnail"),
+            "stream_url": stream_url,
+            "stream_type": metadata.get("stream_type"),
+        }
+    except Exception:
+        return {}
 
-        files = os.listdir(temp_dir)
-        if not files:
-            raise HTTPException(status_code=500, detail="MP3 not found after download")
-        mp3_name = files[0]
-        mp3_path = os.path.join(temp_dir, mp3_name)
 
-        # Send to Telegram (enforces 50MB)
-        send_to_telegram(mp3_path, caption=mp3_name)
+@app.get("/stream/{stream_id}")
+async def stream_from_stream_url(stream_id: str):
+    file_data = database.get(stream_id)  # Make sure this lookup is optimized
+    if not file_data or not file_data.get("file_url") or not file_data.get("file_name"):
+        return {"error": "Invalid stream request!"}
 
-        return FileResponse(mp3_path, filename=mp3_name, media_type="audio/mpeg")
-    except HTTPException:
-        raise
+    streamer = Streamer()
+    try:
+        headers = {"Content-Disposition": f"attachment; filename=\"{file_data.get('file_name')}\""}
+        return StreamingResponse(
+            streamer.stream_file(file_data.get("file_url")), 
+            media_type="application/octet-stream", 
+            headers=headers
+        )
     except Exception as e:
-        logger.exception("Unexpected error in /download")
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+        logging.error(f"Stream Error: {e}")
+        return {"error": "Something went wrong!"}
 
 
-# Optional: run with `python main.py` during local dev
+
+                                        
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=7000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=1470)
+        
