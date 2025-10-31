@@ -30,7 +30,7 @@ ip_address = {}
 
 
 api_keys = {
-    "private": "1a873582a7c83342f961cc0a177b2b26"
+    "private": "AIzaSyCNDWhirI16BIMq66vMVsibtSiUQ6swguY"
 }
 
 api_key_query = APIKeyQuery(name="api_key", auto_error=True)
